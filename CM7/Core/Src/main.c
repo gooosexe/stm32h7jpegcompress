@@ -18,12 +18,13 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "stdio.h"
-#include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,29 +34,30 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
 #ifndef HSEM_ID_0
 #define HSEM_ID_0 (0U) /* HW semaphore 0*/
 #endif
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define IMAGE_HEIGHT 256
-#define IMAGE_WIDTH 256
+#define CHUNK_SIZE 4096
+#define RAW_IMAGE_SIZE 16384 // 128x128 square image
+#define UART_BUF 128
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 JPEG_HandleTypeDef hjpeg;
-JPEG_ConfTypeDef JPEG_Conf;
+
+RNG_HandleTypeDef hrng;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 char TX_buf[16];
-int image[IMAGE_HEIGHT][COLS];
+uint8_t raw_image[RAW_IMAGE_SIZE];  // Raw pixel data (RGB)
+uint8_t jpeg_output[JPEG_OUTPUT_SIZE];  // JPEG compressed output
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -64,38 +66,99 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_JPEG_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_RNG_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// Function to read the matrix from the file
-void read_matrix(const char *filename, int matrix[IMAGE_HEIGHT][IMAGE_WIDTH]) {
-	FILE *file = fopen(filename, "r");
-	if (file == NULL) {
-		perror("Error opening file");
-	}
+// Cooler UART printf that was definitely not just generated with chatgpt along with 90% of this program
+int UART_printf(const char *fmt, ...) {
+	char buf[UART_BUF];
+	va_list args;
+	int len;
 
-	for (int i = 0; i < IMAGE_HEIGHT; i++) {
-		for (int j = 0; j < IMAGE_WIDTH; j++) {
-			fscanf(file, "%d", &matrix[i][j]);
-		}
-	}
+	va_start(args, fmt);
+	len = vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
 
-	fclose(file);
+	HAL_UART_Transmit(&huart2, (uint8_t*) buf, len, HAL_MAX_DELAY);
+
+	return len;
 }
 
-// Function to print the matrix
-void print_matrix(int matrix[IMAGE_HEIGHT][IMAGE_WIDTH]) {
-	for (int i = 0; i < IMAGE_HEIGHT; i++) {
-		for (int j = 0; j < IMAGE_WIDTH; j++) {
-			sprintf(TX_buf, "%d ", matrix[i][j]);  // Convert integer to string
-			HAL_UART_Transmit(&huart2, (uint8_t *)TX_buf, strlen(TX_buf), 10);  // Send over UART
+// Reads a chunk of the JPEG, returns number bytes read
+size_t read_jpeg_chunk(uint8_t *buffer, size_t max_size, size_t offset) {
+	size_t jpegSize;
+
+	if (offset >= jpegSize) {
+		return 0; // No more data
+	}
+
+	size_t bytes_to_read;
+	if ((jpegSize - offset) < max_size) {
+		bytes_to_read = jpegSize - offset;
+	} else {
+		bytes_to_read = max_size;
+	}
+	// Copy chunk into buffer
+	memcpy(buffer, &jpeg_output[offset], bytes_to_read);
+	return bytes_to_read;
+}
+
+// Transmits JPEG in bytes
+void transmit_jpeg() {
+	uint8_t buf[CHUNK_SIZE];
+	size_t offset = 0; // Keeps track of the current read position
+	size_t bytesRead;
+
+	// Keep transmitting until there are no more bytes left
+	while ((bytesRead = read_jpeg_chunk(buf, CHUNK_SIZE, offset)) > 0) {
+		// Transmit current chunk and handle error
+		if (HAL_UART_Transmit(&huart2, buf, bytesRead, HAL_MAX_DELAY)
+				!= HAL_OK) {
+			break;
 		}
-		HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, 10);
+		offset += bytesRead;
 	}
 }
+
+// Generates a number from 0-255 (need a function for this, HAL_RNG gives a 32-bit num)
+uint8_t random_8bit_num(void) {
+	uint32_t random;
+	if (HAL_RNG_GenerateRandomNumber(&hrng, &random) == HAL_OK) {
+		// Map random number to 0-255
+		return (uint8_t) (random % 256);
+	} else
+		return 0; // just in case :)
+}
+
+// Compresses a raw 24-bit RGB random image into JPEG format
+void compress_random_image() {
+	HAL_StatusTypeDef status;
+
+	// Generating image with a bunch of random colours
+	for (uint32_t i = 0; i < RAW_IMAGE_SIZE; i += 3) {
+		raw_image[i] = random_8bit_num();   	// R
+		raw_image[i + 1] = random_8bit_num();   // G
+		raw_image[i + 2] = random_8bit_num(); 	// B
+	}
+
+	status = HAL_JPEG_Encode(&hjpeg, raw_image, RAW_IMAGE_SIZE, jpeg_output,
+			JPEG_BUFFER_SIZE,
+			HAL_MAX_DELAY);
+
+	if (status == HAL_OK) {
+		printf("JPEG Encoding Done\n");
+		// Here, you can, for example, send jpeg_output over UART, store it to SD card, etc.
+	} else {
+		// Handle the error
+		printf("JPEG Encoding Failed!\n");
+	}
+}
+
+void log()
 /* USER CODE END 0 */
 
 /**
@@ -160,13 +223,14 @@ int main(void) {
 	MX_GPIO_Init();
 	MX_JPEG_Init();
 	MX_USART2_UART_Init();
-
-
+	MX_RNG_Init();
 	/* USER CODE BEGIN 2 */
 	// read_matrix("image_data.txt", image);
 	// print_matrix(image);
-	HAL_JPEG_Encode(&hjpeg, pDataInMCU, InDataLength, pDataOut, OutDataLength, Timeout)
-	HAL_UART_Transmit(&huart2, (uint8_t *)"Done!", 32, 10);
+	HAL_JPEG_Encode(&hjpeg, pDataInMCU, InDataLength, pDataOut, OutDataLength,
+			Timeout);
+	//HAL_UART_Transmit(&huart2, (uint8_t*) "Done!", 32, 10);
+	UART_printf("Done!");
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -201,9 +265,11 @@ void SystemClock_Config(void) {
 	/** Initializes the RCC Oscillators according to the specified parameters
 	 * in the RCC_OscInitTypeDef structure.
 	 */
-	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48
+			| RCC_OSCILLATORTYPE_HSI;
 	RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
 	RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+	RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
 	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
 	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
 		Error_Handler();
@@ -233,6 +299,7 @@ void SystemClock_Config(void) {
  * @retval None
  */
 static void MX_JPEG_Init(void) {
+
 	/* USER CODE BEGIN JPEG_Init 0 */
 
 	/* USER CODE END JPEG_Init 0 */
@@ -241,24 +308,37 @@ static void MX_JPEG_Init(void) {
 
 	/* USER CODE END JPEG_Init 1 */
 	hjpeg.Instance = JPEG;
-
-    // Configure basic parameters
-    JPEG_Conf.ImageWidth = IMAGE_WIDTH;
-    JPEG_Conf.ImageHeight = IMAGE_HEIGHT;
-    //JPEG_Conf.ChromaSubsampling = JPEG_420_SUBSAMPLING;
-    JPEG_Conf.ColorSpace = JPEG_YCBCR_COLORSPACE;
-    //JPEG_Conf.Quality = JPEG_QUALITY_MEDIUM;  // adjust as needed
-
 	if (HAL_JPEG_Init(&hjpeg) != HAL_OK) {
-		Error_Handler();
-	}
-
-	if (HAL_JPEG_ConfigEncoding(&hjpeg, &JPEG_Conf) != HAL_OK) {
 		Error_Handler();
 	}
 	/* USER CODE BEGIN JPEG_Init 2 */
 
 	/* USER CODE END JPEG_Init 2 */
+
+}
+
+/**
+ * @brief RNG Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_RNG_Init(void) {
+
+	/* USER CODE BEGIN RNG_Init 0 */
+
+	/* USER CODE END RNG_Init 0 */
+
+	/* USER CODE BEGIN RNG_Init 1 */
+
+	/* USER CODE END RNG_Init 1 */
+	hrng.Instance = RNG;
+	hrng.Init.ClockErrorDetection = RNG_CED_ENABLE;
+	if (HAL_RNG_Init(&hrng) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN RNG_Init 2 */
+
+	/* USER CODE END RNG_Init 2 */
 
 }
 
